@@ -70,7 +70,7 @@ class Paper:
             logger.warning(
                 f"No abstract is provided for {self.url}"
             )
-            return "该论文没有提供摘要。"
+            return "Failed to generate TLDR. No abstract is provided."
 
         prompt = f"""
             Translate the following academic paper abstract into {lang} faithfully and accurately.
@@ -185,16 +185,11 @@ class Paper:
                 ],
             )
 
-            match = re.search(
+            affiliations = re.search(
                 r"\[.*?\]",
                 affiliations,
                 flags=re.DOTALL,
-            )
-
-            if match is None:
-                return []
-
-            affiliations = match.group(0)
+            ).group(0)
             affiliations = json.loads(affiliations)
             affiliations = list(set(affiliations))
             affiliations = [str(a) for a in affiliations]
