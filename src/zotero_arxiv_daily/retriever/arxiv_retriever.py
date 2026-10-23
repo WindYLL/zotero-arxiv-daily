@@ -6,6 +6,7 @@ from ..utils import extract_markdown_from_pdf, extract_tex_code_from_tar
 from tempfile import TemporaryDirectory
 import feedparser
 from tqdm import tqdm
+from types import SimpleNamespace
 import multiprocessing
 import os
 from queue import Empty
@@ -114,25 +115,32 @@ class ArxivRetriever(BaseRetriever):
             raise ValueError("category must be specified for arxiv.")
 
     
-    def _retrieve_raw_papers(self) -> list[ArxivResult]:
-        # One shared client controls the request interval.
-        client = arxiv.Client(
-            page_size=100,
-            delay_seconds=10,
-            num_retries=0,
-        )
-
+    
+    def _retrieve_raw_papers(self) -> list[SimpleNamespace]:
         query = "+".join(self.config.source.arxiv.category)
+        feed_url = f"https://rss.arxiv.org/atom/{query}"
+
+        logger.info(f"Fetching arXiv RSS: {feed_url}")
+        feed = feedparser.parse(feed_url)
+
+        status = feed.get("status", 200)
+        if status >= 400:
+            raise RuntimeError(
+                f"arXiv RSS returned HTTP {status}"
+            )
+
+        if "Feed error for query" in feed.feed.get("title", ""):
+            raise ValueError(f"Invalid arXiv query: {query}")
+
+        if feed.get("bozo") and not feed.entries:
+            raise RuntimeError(
+                f"Failed to parse arXiv RSS: "
+                f"{feed.get('bozo_exception')}"
+            )
+
         include_cross_list = self.config.source.arxiv.get(
             "include_cross_list", False
         )
-
-        feed = feedparser.parse(
-            f"https://rss.arxiv.org/atom/{query}"
-        )
-
-        if "Feed error for query" in feed.feed.title:
-            raise ValueError(f"Invalid arXiv query: {query}")
 
         allowed_types = (
             {"new", "cross"}
@@ -140,104 +148,90 @@ class ArxivRetriever(BaseRetriever):
             else {"new"}
         )
 
-        # Remove duplicate paper IDs while preserving order.
-        all_paper_ids = list(dict.fromkeys(
-            item.id.removeprefix("oai:arXiv.org:")
-            for item in feed.entries
-            if item.get("arxiv_announce_type", "new")
-            in allowed_types
-        ))
+        raw_papers = []
+        seen_ids = set()
+
+        for entry in feed.entries:
+            announce_type = entry.get(
+                "arxiv_announce_type", "new"
+            )
+
+            if announce_type not in allowed_types:
+                continue
+
+            entry_id = entry.get("id", "")
+            if not entry_id.startswith("oai:arXiv.org:"):
+                logger.warning(
+                    f"Skipping invalid arXiv RSS ID: {entry_id}"
+                )
+                continue
+
+            paper_id = entry_id.removeprefix("oai:arXiv.org:")
+
+            if paper_id in seen_ids:
+                continue
+
+            summary = entry.get("summary", "")
+            _, separator, abstract = summary.partition(
+                "Abstract:"
+            )
+
+            if not separator or not abstract.strip():
+                logger.warning(
+                    f"Skipping paper without abstract: {paper_id}"
+                )
+                continue
+
+            author_string = entry.get("author", "")
+            author_names = [
+                name.strip()
+                for name in author_string.split(",")
+                if name.strip()
+            ]
+
+            paper = SimpleNamespace(
+                title=entry.get("title", "").strip(),
+                authors=[
+                    SimpleNamespace(name=name)
+                    for name in author_names
+                ],
+                summary=abstract.strip(),
+                entry_id=f"https://arxiv.org/abs/{paper_id}",
+                pdf_url=f"https://arxiv.org/pdf/{paper_id}",
+                source_url=lambda pid=paper_id: (
+                    f"https://arxiv.org/e-print/{pid}"
+                ),
+            )
+
+            raw_papers.append(paper)
+            seen_ids.add(paper_id)
 
         if self.config.executor.debug:
-            all_paper_ids = all_paper_ids[:10]
+            raw_papers = raw_papers[:10]
 
-        logger.info(
-            f"Found {len(all_paper_ids)} arXiv paper IDs"
-        )
-
-        raw_papers = []
-        batch_size = 100
-        max_attempts = 3
-
-        bar = tqdm(total=len(all_paper_ids))
-
-        try:
-            for start in range(0, len(all_paper_ids), batch_size):
-                batch_ids = all_paper_ids[
-                    start:start + batch_size
-                ]
-                batch_number = start // batch_size + 1
-
-                search = arxiv.Search(
-                    id_list=batch_ids,
-                    max_results=len(batch_ids),
+        if feed.entries and not raw_papers:
+            relevant = any(
+                entry.get("arxiv_announce_type", "new")
+                in allowed_types
+                for entry in feed.entries
+            )
+            if relevant:
+                raise RuntimeError(
+                    "RSS entries found, but no valid papers parsed"
                 )
 
-                for attempt in range(max_attempts):
-                    try:
-                        results = list(client.results(search))
-                        raw_papers.extend(results)
-                        break
-
-                    except arxiv.HTTPError as exc:
-                        if exc.status == 429:
-                            if attempt == max_attempts - 1:
-                                logger.error(
-                                    "arXiv rate limit persists on "
-                                    f"batch {batch_number}. "
-                                    "Stopping further API requests; "
-                                    f"{len(raw_papers)} papers retrieved."
-                                )
-
-                                if not raw_papers:
-                                    raise RuntimeError(
-                                        "arXiv returned 429 before "
-                                        "any papers were retrieved"
-                                    ) from exc
-
-                                self._raw_by_url = {
-                                    p.entry_id: p
-                                    for p in raw_papers
-                                }
-                                return raw_papers
-
-                            wait = 60 * (2 ** attempt)
-
-                            logger.warning(
-                                f"arXiv 429 on batch {batch_number}; "
-                                f"retrying after {wait}s"
-                            )
-                            sleep(wait)
-
-                        else:
-                            logger.warning(
-                                f"arXiv HTTP {exc.status} "
-                                f"on batch {batch_number}; "
-                                "skipping this batch"
-                            )
-                            break
-
-                    except arxiv.ArxivError as exc:
-                        logger.warning(
-                            f"arXiv error on batch "
-                            f"{batch_number}: {exc}"
-                        )
-                        break
-
-                bar.update(len(batch_ids))
-
-        finally:
-            bar.close()
-
         self._raw_by_url = {
-            p.entry_id: p for p in raw_papers
+            paper.entry_id: paper
+            for paper in raw_papers
         }
 
         logger.info(
-            f"Retrieved metadata for {len(raw_papers)} papers"
+            f"Retrieved metadata for {len(raw_papers)} "
+            "arXiv papers directly from RSS"
         )
 
         return raw_papers
+
    
     
     def convert_to_paper(self, raw_paper: ArxivResult) -> Paper:
